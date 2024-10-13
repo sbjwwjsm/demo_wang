@@ -65,10 +65,25 @@ class GiftController extends Controller
             return responseError(ApiStatus::PLATFORM_COIN_INSUFFICIENT);
         }
 
+		# 一次性 扣除金币，单次异常是按照需求在异常再处理（这样金币就不会一次次的递减，造成用户数据卡顿时显示问题
+                if ($userCoinBalance < $$eachUserGiftCoin * $to_uid_num) {
+                    throw new \Illuminate\Database\QueryException('余额不足，扣款失败', [], new \PDOException());
+                }
+				//利用mysql 原子性 捕获超出范围异常
+				try{
+					$affectedRows = User::query()->where('id', $uid)->decrement('coin', $eachUserGiftCoin * $to_uid_num);
+					//可以判断$affectedRows  如果框架是否可以判断
+				}catch(PDOException $e){
+					if ($e->getCode() == '22003') { // MySQL 错误代码 22003 表示数值超出范围
+					// 捕获 MySQL 的数值超出范围异常
+					throw new \Illuminate\Database\QueryException('余额不足，扣款失败', [], $e);
+				}
+		
         try {
             foreach ($to_uid as $v) {
-                # 赠送礼物
-                GiftRepository::Factory()->doGiveGroupGift($uid, $v, $giftInfo, $scene, $scene_id, $number_group, $eachUserGiftCoin, $giftUnitCoin);
+                # 赠送礼物（可以协程或异步操作
+                GiftRepository::Factory()->doGiveGroupGift2($uid, $v, $giftInfo, $scene, $scene_id, $number_group, $eachUserGiftCoin, $giftUnitCoin);
+				
             }
             return responseSuccess();
         } catch (Throwable $e) {

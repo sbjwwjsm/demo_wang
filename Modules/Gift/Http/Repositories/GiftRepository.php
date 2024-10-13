@@ -20,14 +20,117 @@ class GiftRepository
      */
     public function addGiftWall($uid, $gift_id, $gift_number = 1): void
     {
+		/*
         if (GiftWall::query()->where(['uid' => $uid, 'gift_id' => $gift_id])->exists()) {
             GiftWall::query()->where(['uid' => $uid, 'gift_id' => $gift_id])->increment('gift_number', $gift_number);
         } else {
             GiftWall::query()->create([
                 'gift_number' => $gift_number, 'uid' => $uid, 'gift_id' => $gift_id
             ]);
+        }*/
+		
+		// 锁
+		DB::transaction(function () use ($uid, $gift_id, $gift_number) {
+        // 锁定行，防止竞态条件
+        $giftWall = GiftWall::query()->where(['uid' => $uid, 'gift_id' => $gift_id])->lockForUpdate()->first();
+
+        if ($giftWall) {
+            // 如果记录存在，更新礼物数量
+            $giftWall->increment('gift_number', $gift_number);
+        } else {
+            // 如果记录不存在，创建新的记录
+            GiftWall::query()->create([
+                'gift_number' => $gift_number,
+                'uid'         => $uid,
+                'gift_id'     => $gift_id
+            ]);
         }
+		});
+		
+		///更好的级别
+		GiftWall::updateOrInsert(
+    // 查找条件
+    ['uid' => $uid, 'gift_id' => $gift_id],
+    // 更新或者插入的值
+    ['gift_number' => DB::raw('gift_number + ' . $gift_number)]
+);
+		
     }
+	
+	private function dispatchAsyncGiftTasks($uid, $to_uid, $giftInfo, $room_id, $eachUserGiftCoin, $giftUnitCoin, $bill_id)
+{
+    // 1. 计算N倍增幅的礼物收益
+    $multipleNum = 100; // 通过算法计算该礼物会返回给赠送者N倍的礼物价值
+    $backCoin = bcmul($multipleNum, $giftUnitCoin, 8);
+    if ($backCoin > 0) {
+        // 将返币操作异步处理
+        GiveGiftJob::dispatch([
+            'uid' => $uid,
+            'to_uid' => $to_uid,
+            'backCoin' => $backCoin,
+            'bill_id' => $bill_id,
+            'room_id' => $room_id,
+        ]);
+    }
+
+    // 2. 异步更新房间排行榜、消费数据、用户贡献
+    RankingUpdateJob::dispatch([
+        'room_id' => $room_id,
+        'uid' => $uid,
+        'to_uid' => $to_uid,
+        'giftInfo' => $giftInfo,
+        'eachUserGiftCoin' => $eachUserGiftCoin,
+    ]);
+
+    // 3. 异步分配收益，更新礼物墙
+    GiftIncomeDistributionJob::dispatch($eachUserGiftCoin, $room_id, $bill_id, $to_uid);
+
+    // 4. 异步更新送礼人魅力值、等级加分等
+    CharmUpdateJob::dispatch([
+        'uid' => $uid,
+        'to_uid' => $to_uid,
+        'giftInfo' => $giftInfo,
+        'eachUserGiftCoin' => $eachUserGiftCoin,
+    ]);
+
+    // 5. 异步推送礼物和房间公告通知
+    GiftNotificationJob::dispatch([
+        'uid' => $uid,
+        'to_uid' => $to_uid,
+        'multipleNum' => $multipleNum,
+        'room_id' => $room_id,
+    ])->delay(now()->addSeconds(1));
+}
+
+public function doGiveGroupGift2($uid, $to_uid, $giftInfo, $scene, $room_id, $number_group, $eachUserGiftCoin, $giftUnitCoin){
+	try {
+	# 记录礼物赠送记录
+                $giftBillInfo = [
+                    'uid'          => $uid,
+                    'to_uid'       => $to_uid,
+                    'gift_id'      => $giftInfo['id'],
+                    'gift_name'    => $giftInfo['name'],
+                    'gift_number'  => 1, //
+                    'number_group' => $number_group, //礼物组数
+                    'gift_coin'    => $eachUserGiftCoin,
+                    'gift_money'   => $this->coin2money($eachUserGiftCoin),
+                    'room_id'      => $room_id,
+                ];
+
+                $bill_id = GiftBill::query()->insertGetId($giftBillInfo);
+
+                # 上礼物墙
+                $this->addGiftWall($to_uid, $giftInfo['id']);
+
+				// 4. 异步处理部分：收益计算、房间统计、排行榜等通过队列异步处理
+            $this->dispatchAsyncGiftTasks($uid, $to_uid, $giftInfo, $room_id, $eachUserGiftCoin, $giftUnitCoin, $bill_id);
+	} catch (Throwable $e) {
+            dp($e->getMessage(), $e->getTraceAsString());
+            return false;
+        }
+	
+	
+}
 
     /**
      * 赠送幸运礼物(按组赠送礼物)
@@ -61,6 +164,8 @@ class GiftRepository
 
                 # 上礼物墙
                 $this->addGiftWall($to_uid, $giftInfo['id']);
+
+
 
                 // 记录收礼人返币帐单
                 $multipleNum = 100;//通过一定算法计算该礼物会返回给赠送者N倍的礼物价值;
